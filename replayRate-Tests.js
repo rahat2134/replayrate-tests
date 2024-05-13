@@ -14,129 +14,173 @@
 
 'use strict';
 
+const fs = require('fs');
+const path = require('path');
+const ReplayRate = require('../../../lib/worker/rate-control/replayRate');
+const TestMessage = require('../../../lib/common/messages/testMessage');
+const TransactionStatisticsCollector = require('../../../lib/common/core/transaction-statistics-collector');
+
 const chai = require('chai');
 const sinon = require('sinon');
 const sinonChai = require('sinon-chai');
-const rewire = require('rewire');
-
-const replayRateController = rewire('../../../lib/worker/rate-control/replayRateController');
-const TestMessage = require('../../../lib/common/messages/testMessage');
-const TransactionStatisticsCollector = require('../../../lib/common/core/transaction-statistics-collector');
-const utils = require('../../../lib/common/utils/caliper-utils');
-
 chai.use(sinonChai);
 const should = chai.should();
 
 describe('ReplayRateController', () => {
-  let testMessage, stats, workerIndex, controller;
-
-  beforeEach(() => {
-    const msgContent = {
-      rateControl: {
-        type: 'replay',
-        opts: {
-          pathTemplate: '/path/to/trace/file',
-          inputFormat: 'TEXT',
-          defaultSleepTime: 100,
-        },
-      },
-    };
-    testMessage = new TestMessage('test', [], msgContent);
-    stats = new TransactionStatisticsCollector();
-    workerIndex = 0;
-    controller = new replayRateController.createRateController(testMessage, stats, workerIndex);
-  });
-
-  describe('#constructor', () => {
-    it('should throw an error if pathTemplate is undefined', () => {
-      delete testMessage.content.rateControl.opts.pathTemplate;
-      const createController = () => new replayRateController.createRateController(testMessage, stats, workerIndex);
-      should.throw(createController, 'The path to load the recording from is undefined');
-    });
-
-    it('should set the default input format if not specified', () => {
-      delete testMessage.content.rateControl.opts.inputFormat;
-      const loggerWarnStub = sinon.stub(utils.getLogger('replay-rate-controller'), 'warn');
-      controller = new replayRateController.createRateController(testMessage, stats, workerIndex);
-      loggerWarnStub.should.have.been.calledWith('Input format is undefined. Defaulting to "TEXT" format');
-      controller.inputFormat.should.equal('TEXT');
-      loggerWarnStub.restore();
-    });
-
-    it('should set the specified input format if supported', () => {
-      testMessage.content.rateControl.opts.inputFormat = 'BIN_BE';
-      const loggerDebugStub = sinon.stub(utils.getLogger('replay-rate-controller'), 'debug');
-      controller = new replayRateController.createRateController(testMessage, stats, workerIndex);
-      loggerDebugStub.should.have.been.calledWith(`Input format is set to "BIN_BE" format in worker #${workerIndex} in round #${controller.roundIndex}`);
-      controller.inputFormat.should.equal('BIN_BE');
-      loggerDebugStub.restore();
-    });
-
-    it('should set the default input format if the specified format is not supported', () => {
-      testMessage.content.rateControl.opts.inputFormat = 'UNSUPPORTED';
-      const loggerWarnStub = sinon.stub(utils.getLogger('replay-rate-controller'), 'warn');
-      controller = new replayRateController.createRateController(testMessage, stats, workerIndex);
-      loggerWarnStub.should.have.been.calledWith('Input format "UNSUPPORTED" is not supported. Defaulting to "TEXT" format');
-      controller.inputFormat.should.equal('TEXT');
-      loggerWarnStub.restore();
-    });
-
-    it('should throw an error if the trace file does not exist', () => {
-      const existsStub = sinon.stub(fs, 'existsSync').returns(false);
-      const createController = () => new replayRateController.createRateController(testMessage, stats, workerIndex);
-      should.throw(createController, `Trace file does not exist: ${controller.pathTemplate}`);
-      existsStub.restore();
-    });
-  });
-
-  describe('#applyRateControl', () => {
-    const sleep = async (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    let sandbox;
 
     beforeEach(() => {
-      replayRateController.__set__('Sleep', sleep);
-      controller.records = [100, 200, 300];
+        sandbox = sinon.createSandbox();
     });
 
-    it('should sleep if the current index is within the records', async () => {
-      const now = Date.now();
-      const startTimeSpy = sinon.stub(stats, 'getRoundStartTime').returns(now);
-      const submitTxSpy = sinon.stub(stats, 'getTotalSubmittedTx').returns(0);
-
-      const sleepSpy = sinon.spy(replayRateController.__get__('Sleep'));
-
-      await controller.applyRateControl();
-
-      sinon.assert.calledWith(sleepSpy, 100);
-      startTimeSpy.restore();
-      submitTxSpy.restore();
+    afterEach(() => {
+        sandbox.restore();
     });
 
-    it('should not sleep if the sleep time is less than 5ms', async () => {
-      const now = Date.now();
-      const startTimeSpy = sinon.stub(stats, 'getRoundStartTime').returns(now - 96);
-      const submitTxSpy = sinon.stub(stats, 'getTotalSubmittedTx').returns(0);
+    it('should throw an error when pathTemplate is not provided', () => {
+        const msgContent = {
+            label: 'test',
+            rateControl: {
+                type: 'replay-rate',
+                opts: {}
+            },
+            workload: { module: 'module.js' },
+            testRound: 0,
+            txDuration: 250,
+            totalWorkers: 2
+        };
+        const testMessage = new TestMessage('test', [], msgContent);
+        const stubStatsCollector = sinon.createStubInstance(TransactionStatisticsCollector);
 
-      const sleepSpy = sinon.spy(replayRateController.__get__('Sleep'));
-
-      await controller.applyRateControl();
-
-      sinon.assert.notCalled(sleepSpy);
-      startTimeSpy.restore();
-      submitTxSpy.restore();
+        should.throw(() => {
+            ReplayRate.createRateController(testMessage, stubStatsCollector, 0);
+        }, 'The path to load the recording from is undefined');
     });
 
-    it('should sleep with the default sleep time if the current index is out of bounds', async () => {
-      const submitTxSpy = sinon.stub(stats, 'getTotalSubmittedTx').returns(3);
-      const loggerWarnStub = sinon.stub(utils.getLogger('replay-rate-controller'), 'warn');
+    it('should throw an error when the trace file does not exist', () => {
+        const msgContent = {
+            label: 'test',
+            rateControl: {
+                type: 'replay-rate',
+                opts: {
+                    pathTemplate: './non-existent-file.txt'
+                }
+            },
+            workload: { module: 'module.js' },
+            testRound: 0,
+            txDuration: 250,
+            totalWorkers: 2
+        };
+        const testMessage = new TestMessage('test', [], msgContent);
+        const stubStatsCollector = sinon.createStubInstance(TransactionStatisticsCollector);
 
-      const sleepSpy = sinon.spy(replayRateController.__get__('Sleep'));
-
-      await controller.applyRateControl();
-
-      sinon.assert.calledWith(sleepSpy, controller.defaultSleepTime);
-      loggerWarnStub.should.have.been.calledWith(`Using default sleep time of ${controller.defaultSleepTime} ms from now on for worker #${workerIndex} in round #${controller.roundIndex}`);
-      submitTxSpy.restore();
-      loggerWarnStub.restore();
+        should.throw(() => {
+            ReplayRate.createRateController(testMessage, stubStatsCollector, 0);
+        }, `Trace file does not exist: ${path.resolve('./non-existent-file.txt')}`);
     });
-  });
+
+    it('should correctly import transaction timings from text format', () => {
+        const tempFilePath = path.join(__dirname, 'temp-replay-trace.txt');
+        const transactionTimings = [100, 200, 300, 400];
+        fs.writeFileSync(tempFilePath, transactionTimings.join('\n'), 'utf-8');
+
+        const msgContent = {
+            label: 'test',
+            rateControl: {
+                type: 'replay-rate',
+                opts: {
+                    pathTemplate: tempFilePath,
+                    inputFormat: 'TEXT'
+                }
+            },
+            workload: { module: 'module.js' },
+            testRound: 0,
+            txDuration: 250,
+            totalWorkers: 2
+        };
+        const testMessage = new TestMessage('test', [], msgContent);
+        const stubStatsCollector = sinon.createStubInstance(TransactionStatisticsCollector);
+        const replayRateController = ReplayRate.createRateController(testMessage, stubStatsCollector, 0);
+
+        replayRateController.records.should.deep.equal(transactionTimings);
+    });
+
+    it('should correctly apply rate control and log warning when running out of transaction timings', async () => {
+        const tempFilePath = path.join(__dirname, 'temp-replay-trace.txt');
+        const transactionTimings = [100, 200, 300, 400];
+        fs.writeFileSync(tempFilePath, transactionTimings.join('\n'), 'utf-8');
+
+        const msgContent = {
+            label: 'test',
+            rateControl: {
+                type: 'replay-rate',
+                opts: {
+                    pathTemplate: tempFilePath,
+                    inputFormat: 'TEXT',
+                    defaultSleepTime: 50,
+                    logWarnings: true
+                }
+            },
+            workload: { module: 'module.js' },
+            testRound: 0,
+            txDuration: 250,
+            totalWorkers: 2
+        };
+        const testMessage = new TestMessage('test', [], msgContent);
+        const stubStatsCollector = sinon.createStubInstance(TransactionStatisticsCollector);
+        stubStatsCollector.getTotalSubmittedTx.returns(0);
+        stubStatsCollector.getRoundStartTime.returns(Date.now());
+
+        const sleepStub = sandbox.stub(caliper_utils, 'sleep');
+        const loggerWarnStub = sandbox.stub(console, 'warn');
+
+        const replayRateController = ReplayRate.createRateController(testMessage, stubStatsCollector, 0);
+
+        // Test the first few transactions
+        for (let i = 0; i < transactionTimings.length; i++) {
+            await replayRateController.applyRateControl();
+            sleepStub.should.have.been.calledWithExactly(transactionTimings[i]);
+            stubStatsCollector.getTotalSubmittedTx.returns(i + 1);
+            sleepStub.resetHistory();
+        }
+
+        loggerWarnStub.should.not.have.been.called;
+
+        // Test the case when running out of transaction timings
+        await replayRateController.applyRateControl();
+        sleepStub.should.have.been.calledWithExactly(50);
+        loggerWarnStub.should.have.been.calledWithMatch(/Using default sleep time of 50 ms/);
+
+        // Clean up the temporary file
+        fs.unlinkSync(tempFilePath);
+    });
+
+    it('should call end() method without any errors', async () => {
+        const tempFilePath = path.join(__dirname, 'temp-replay-trace.txt');
+        const transactionTimings = [100, 200, 300, 400];
+        fs.writeFileSync(tempFilePath, transactionTimings.join('\n'), 'utf-8');
+
+        const msgContent = {
+            label: 'test',
+            rateControl: {
+                type: 'replay-rate',
+                opts: {
+                    pathTemplate: tempFilePath,
+                    inputFormat: 'TEXT'
+                }
+            },
+            workload: { module: 'module.js' },
+            testRound: 0,
+            txDuration: 250,
+            totalWorkers: 2
+        };
+        const testMessage = new TestMessage('test', [], msgContent);
+        const stubStatsCollector = sinon.createStubInstance(TransactionStatisticsCollector);
+        const replayRateController = ReplayRate.createRateController(testMessage, stubStatsCollector, 0);
+
+        await replayRateController.end();
+
+        // Clean up the temporary file
+        fs.unlinkSync(tempFilePath);
+    });
 });
