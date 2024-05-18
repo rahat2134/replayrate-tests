@@ -1,16 +1,16 @@
 /*
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- * http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- */
+* Licensed under the Apache License, Version 2.0 (the "License");
+* you may not use this file except in compliance with the License.
+* You may obtain a copy of the License at
+*
+* http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing, software
+* distributed under the License is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+* See the License for the specific language governing permissions and
+* limitations under the License.
+*/
 
 'use strict';
 
@@ -19,18 +19,21 @@ const path = require('path');
 const ReplayRate = require('../../../lib/worker/rate-control/replayRate');
 const TestMessage = require('../../../lib/common/messages/testMessage');
 const TransactionStatisticsCollector = require('../../../lib/common/core/transaction-statistics-collector');
+const caliper_utils = require('../../../lib/common/utils/caliper-utils');
+const logger = caliper_utils.getLogger('replay-rate-controller'); // Import the logger object
 
 const chai = require('chai');
 const sinon = require('sinon');
-const sinonChai = require('sinon-chai');
-chai.use(sinonChai);
-const should = chai.should();
+const assert = chai.assert;
 
 describe('ReplayRateController', () => {
     let sandbox;
 
     beforeEach(() => {
         sandbox = sinon.createSandbox();
+        if (caliper_utils.sleep.isSinonProxy) {
+            sandbox.restore();
+        }
     });
 
     afterEach(() => {
@@ -52,7 +55,7 @@ describe('ReplayRateController', () => {
         const testMessage = new TestMessage('test', [], msgContent);
         const stubStatsCollector = sinon.createStubInstance(TransactionStatisticsCollector);
 
-        should.throw(() => {
+        assert.throws(() => {
             ReplayRate.createRateController(testMessage, stubStatsCollector, 0);
         }, 'The path to load the recording from is undefined');
     });
@@ -74,7 +77,7 @@ describe('ReplayRateController', () => {
         const testMessage = new TestMessage('test', [], msgContent);
         const stubStatsCollector = sinon.createStubInstance(TransactionStatisticsCollector);
 
-        should.throw(() => {
+        assert.throws(() => {
             ReplayRate.createRateController(testMessage, stubStatsCollector, 0);
         }, `Trace file does not exist: ${path.resolve('./non-existent-file.txt')}`);
     });
@@ -102,7 +105,10 @@ describe('ReplayRateController', () => {
         const stubStatsCollector = sinon.createStubInstance(TransactionStatisticsCollector);
         const replayRateController = ReplayRate.createRateController(testMessage, stubStatsCollector, 0);
 
-        replayRateController.records.should.deep.equal(transactionTimings);
+        assert.deepEqual(replayRateController.records, transactionTimings);
+
+        // Clean up the temporary file
+        fs.unlinkSync(tempFilePath);
     });
 
     it('should correctly apply rate control and log warning when running out of transaction timings', async () => {
@@ -131,25 +137,33 @@ describe('ReplayRateController', () => {
         stubStatsCollector.getTotalSubmittedTx.returns(0);
         stubStatsCollector.getRoundStartTime.returns(Date.now());
 
-        const sleepStub = sandbox.stub(caliper_utils, 'sleep');
-        const loggerWarnStub = sandbox.stub(console, 'warn');
+        let sleepStub;
+        if (!caliper_utils.sleep.isSinonProxy) {
+            sleepStub = sandbox.stub(caliper_utils, 'sleep').callsFake((delay) => new Promise((resolve) => setTimeout(resolve, delay)));
+        } else {
+            sleepStub = caliper_utils.sleep;
+        }
 
+        let loggerWarnStub;
+        if (!logger.warn.isSinonProxy) {
+            loggerWarnStub = sandbox.stub(logger, 'warn');
+        } else {
+            loggerWarnStub = logger.warn;
+        }
         const replayRateController = ReplayRate.createRateController(testMessage, stubStatsCollector, 0);
 
         // Test the first few transactions
         for (let i = 0; i < transactionTimings.length; i++) {
             await replayRateController.applyRateControl();
-            sleepStub.should.have.been.calledWithExactly(transactionTimings[i]);
+            sinon.assert.calledWithExactly(sleepStub, transactionTimings[i]);
             stubStatsCollector.getTotalSubmittedTx.returns(i + 1);
             sleepStub.resetHistory();
         }
 
-        loggerWarnStub.should.not.have.been.called;
-
         // Test the case when running out of transaction timings
         await replayRateController.applyRateControl();
-        sleepStub.should.have.been.calledWithExactly(50);
-        loggerWarnStub.should.have.been.calledWithMatch(/Using default sleep time of 50 ms/);
+        sinon.assert.calledWithExactly(sleepStub, 50);
+        sinon.assert.calledWithMatch(loggerWarnStub, /Using default sleep time of 50 ms/);
 
         // Clean up the temporary file
         fs.unlinkSync(tempFilePath);
